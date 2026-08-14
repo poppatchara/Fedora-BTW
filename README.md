@@ -86,7 +86,26 @@ mount --mkdir UUID="${esp_uuid}" /mnt/boot
 swapon UUID="${swap_uuid}"
 
 mkdir -p /mnt/etc
-genfstab -U /mnt > /mnt/etc/fstab           # install arch-install-scripts on live ISO
+
+# Fedora live ISO has no `genfstab` (that's an Arch tool) — write /etc/fstab
+# by hand. `pass` is 0 for btrfs (it has built-in consistency checks;
+# traditional fsck does not apply); x-systemd.device-timeout=0 stops systemd
+# from failing fast when a device is slightly slow to appear at boot.
+# NOTE: use an UNQUOTED heredoc so ${root_uuid} / ${esp_uuid} / ${swap_uuid}
+# expand to the real values captured above via blkid.
+cat > /mnt/etc/fstab <<EOF
+# <file system> <mount point> <type> <options> <dump> <pass>
+UUID=${root_uuid} /                 btrfs subvol=/@,compress=zstd:1,noatime,x-systemd.device-timeout=0 0 0
+UUID=${root_uuid} /home             btrfs subvol=/@home,compress=zstd:1,noatime,x-systemd.device-timeout=0 0 0
+UUID=${root_uuid} /var              btrfs subvol=/@var,compress=zstd:1,noatime,x-systemd.device-timeout=0 0 0
+UUID=${root_uuid} /var/log          btrfs subvol=/@var_log,noatime,x-systemd.device-timeout=0 0 0
+UUID=${root_uuid} /var/cache        btrfs subvol=/@var_cache,noatime,x-systemd.device-timeout=0 0 0
+UUID=${root_uuid} /root             btrfs subvol=/@root,noatime,x-systemd.device-timeout=0 0 0
+UUID=${root_uuid} /srv              btrfs subvol=/@srv,noatime,x-systemd.device-timeout=0 0 0
+UUID=${esp_uuid}  /boot             vfat umask=0077,shortname=winnt 0 2
+UUID=${swap_uuid} none              swap sw 0 0
+EOF
+
 cat /mnt/etc/fstab
 ```
 
@@ -96,6 +115,10 @@ cat /mnt/etc/fstab
 `dnf --installroot` is Fedora's `pacstrap`. First write a repo file so dnf knows where to pull from.
 
 ```bash
+# Fedora live ISO has no `pacstrap`; `dnf --installroot` is the equivalent
+# (it lets dnf write into /mnt before any chroot exists).
+
+# 1) repo file so dnf knows where to pull from
 mkdir -p /mnt/etc/yum.repos.d
 cat > /mnt/etc/yum.repos.d/fedora.repo <<'EOF'
 [fedora]
@@ -109,10 +132,18 @@ gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-$releasever-$basearch
 skip_if_unavailable=False
 EOF
 
-dnf --installroot=/mnt --releasever=44 group install "Core"
-
-for f in dev proc sys sys/firmware/efi/efivars; do mount --bind /$f /mnt/$f; done
+# copy the network resolver in BEFORE dnf runs, so metalink lookups resolve
 cp /etc/resolv.conf /mnt/etc/resolv.conf
+
+# mount the virtual filesystems BEFORE dnf --installroot. dnf runs RPM
+# scriptlets against the target tree; without /proc + /sys they fail with
+# e.g. "cpio: cap_set_file failed - Operation not supported" (the scriptlets
+# can't set capabilities when /proc is absent).
+for f in dev proc sys sys/firmware/efi/efivars; do mount --bind /$f /mnt/$f; done
+
+# `core` is the Fedora group id for a minimal base (comps display name "Core").
+dnf --installroot=/mnt --releasever=44 group install core
+
 chroot /mnt /bin/bash
 ```
 
@@ -120,69 +151,19 @@ chroot /mnt /bin/bash
 
 ## Speed Up dnf (live ISO)
 
-Make the live ISO's `dnf` faster before bootstrapping. Fedora defaults to 3 parallel downloads and lets MirrorManager (server-side) pick mirrors with smarter heuristics than any client-side tool.
-
-> **Note:** the parallel `dnf.conf` settings apply to the **live ISO session**. If you want them on the installed system too, repeat them inside the chroot (chroot inherits `/etc/dnf/dnf.conf` from the live ISO via the mount bind only if you copy it — see below).
-
-### Parallel downloads
-
-Fedora ships dnf5, configured for 3 concurrent downloads. On a fast link that leaves bandwidth on the table. Bump it up (max 20):
+Bump parallel downloads (default 3, max 20) and bias mirror selection to your region on the **live ISO** before bootstrapping:
 
 ```bash
-sudo dnf config-manager setopt max_parallel_downloads=10 \
-      max_downloads_per_mirror=10
-```
+# parallel downloads (persist to install root for installed system)
+sudo dnf config-manager setopt max_parallel_downloads=10 max_downloads_per_mirror=10
+cp /etc/dnf/dnf.conf /mnt/etc/dnf/dnf.conf
 
-This writes to `/etc/dnf/dnf.conf` on the **live ISO**. To carry it into the installed system, either rerun it inside the chroot, or copy the file:
-
-```bash
-cp /etc/dnf/dnf.conf /mnt/etc/dnf/dnf.conf   # before chroot
-```
-
-| Option | Default | Max | Effect |
-|--------|---------|-----|--------|
-| `max_parallel_downloads` | 3 | 20 | Concurrent package downloads overall |
-| `max_downloads_per_mirror` | 3 | 20 | Concurrent downloads from a single mirror |
-
-**Leave `fastestmirror=False`.** Unlike `reflector`, Fedora's `fastestmirror` ranks mirrors by **TCP socket latency only** — it ignores bandwidth and overrides MirrorManager's ordering. Fedora's server-side mirror selection already accounts for bandwidth, geographic proximity, and load, so it is almost always smarter. If you enable it anyway and it feels worse, turn it off.
-
-### Reflector-like mirror list
-
-Fedora has no direct `reflector` — but you don't need one. The `metalink` URL asks Fedora MirrorManager to return a ranked mirror list, and you can bias it toward your region with the `country=` param (ISO 3166-1 alpha-2, comma-separated). This is the Fedora equivalent of `reflector -c Thailand -c Singapore`.
-
-Add your region to the `metalink` lines in `/etc/yum.repos.d/fedora.repo` and `/etc/yum.repos.d/fedora-updates.repo`:
-
-```bash
-# live ISO: Asia-Pacific preference (th/sg/my), fall back to global
-sudo sed -i \
-  's#metalink=\(.*\)#metalink=\1\&country=th,sg,my#' \
+# regional mirrors — append country= to the metalink (ISO 3166 alpha-2)
+sudo sed -i 's#metalink=\(.*\)#metalink=\1\&country=th,sg,my#' \
   /etc/yum.repos.d/fedora.repo /etc/yum.repos.d/fedora-updates.repo
 ```
 
-Or edit by hand — the `country` lives at the end of each `metalink` line:
-
-```ini
-# /etc/yum.repos.d/fedora.repo
-metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch&country=th,sg,my
-
-# /etc/yum.repos.d/fedora-updates.repo
-metalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch&country=th,sg,my
-```
-
-For persistent overrides that survive dnf repo resets, drop a file in `/etc/dnf/repos.override.d/` instead (you only need the repos you use — `[fedora]` and `[updates]`):
-
-```bash
-sudo mkdir -p /etc/dnf/repos.override.d
-sudo tee /etc/dnf/repos.override.d/95-mirrors.repo >/dev/null <<'EOF'
-[fedora]
-metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch&country=th,sg,my
-
-[updates]
-metalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch&country=th,sg,my
-EOF
-```
-
-> **RPM Fusion** and **Terra** (added later in this guide) use their own `baseurl` lists — the `country=` mirror trick does not apply to them. RPM Fusion publishes a country-specific mirrorlist at `https://mirrors.rpmfusion.org/mirrorlist?repo=...&arch=...&country=th` if you want the same treatment there.
+Leave `fastestmirror=False`: Fedora's filter ranks mirrors by **TCP latency only** — it ignores bandwidth and overrides MirrorManager's (server-side) bandwidth/load/geo heuristics. On the installed system the bootstrap `fedora.repo` already carries `&country=th,sg,my`; rerun the two `dnf` lines inside the chroot if you want the same there. `country=` does not apply to RPM Fusion / Terra (they use `baseurl`).
 
 ### Verify
 
@@ -198,7 +179,7 @@ sudo dnf repolist -v   # Base URLs should show th/sg/my mirrors (e.g. mirror.kku
 
 ## Chroot Config
 ```bash
-dnf group install "Standard" "Development Tools"    # ≈ base-devel
+dnf group install standard "Development Tools"    # ≈ base-devel
 dnf install kernel kernel-core linux-firmware microcode_ctl \
   btrfs-progs dosfstools e2fsprogs exfatprogs efibootmgr \
   NetworkManager openssh-server \
@@ -224,7 +205,7 @@ passwd
 useradd -mG wheel,storage,power,audio,video -s /bin/bash pop
 passwd pop
 chown -R pop:pop /home/pop
-visudo                                          # uncomment: %wheel ALL=(ALL) ALL
+EDITOR=nvim visudo                                    # uncomment: %wheel ALL=(ALL) ALL
 
 dracut --regenerate-all --force                 # btrfs + microcode auto-included
 ```
