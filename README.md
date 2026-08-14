@@ -195,7 +195,7 @@ dnf install kernel kernel-core linux-firmware microcode_ctl \
   zsh zsh-autosuggestions bash-completion \
   pipewire pipewire-alsa pipewire-pulseaudio pipewire-jack-audio-connection-kit wireplumber \
   inotify-tools dracut \
-  grub2-efi-x64 grub2-tools shim-x64 os-prober \
+  grub2-efi-x64 grub2-tools shim-x64 \
   langpacks-en 7zip netcat
 ```
 
@@ -251,7 +251,7 @@ GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="$(sed 's, release .*$,,g' /etc/system-release)"
 GRUB_DEFAULT=saved
 GRUB_DISABLE_SUBMENU=true
-GRUB_TERMINAL_OUTPUT="console"
+GRUB_TERMINAL_OUTPUT="gfxterm"
 GRUB_CMDLINE_LINUX="rhgb quiet loglevel=3 rootflags=subvol=@ resume=UUID=${swap_uuid} zswap.enabled=1 zswap.compressor=lz4 zswap.max_pool_percent=50 zswap.zpool=zsmalloc"
 GRUB_DISABLE_RECOVERY="true"
 EOF
@@ -259,10 +259,6 @@ EOF
 # ESP is mounted at /boot/efi; the real grub.cfg lives at /boot/grub2/grub.cfg on btrfs /boot
 grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Fedora
 grub2-mkconfig -o /boot/grub2/grub.cfg
-
-# dual-boot? uncomment for os-prober:
-# echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
-# grub2-mkconfig -o /boot/grub2/grub.cfg
 ```
 
 ---
@@ -321,9 +317,23 @@ dnf install snapper btrfs-assistant btrfsmaintenance
 snapper -c root create-config /
 snapper -c home create-config /home
 
-# snap-pac equivalent: auto-snapshot on every dnf transaction
-dnf copr enable biyuan/dnf5-autosnapper
-dnf install dnf5-autosnapper
+# dnf5 (Fedora 41+) has no official snapper plugin — wire it up via the
+# libdnf5 "actions" plugin (in Fedora repos, no COPR needed). Recreates
+# Arch's snap-pac: auto pre/post snapshots on every dnf transaction.
+dnf install libdnf5-plugin-actions
+cat > /etc/dnf/libdnf5-plugins/actions.d/snapper.actions <<'EOF'
+# libdnf5-plugin-actions snapper integration — pre/post snapshot number kept
+# in plugin-provided tmp.* variables between the two phases; -c number enables
+# snapper auto-cleanup. source: Fedora Discussion #133948
+# Get the snapshot description
+pre_transaction::::/usr/bin/sh -c echo "tmp.cmd=$(ps -o command --no-headers -p '${pid}')"
+# Creates pre snapshots for root and home, store snapshot numbers
+pre_transaction::::/usr/bin/sh -c echo "tmp.snapper_pre_root=$(snapper -c root create -c number -t pre -p -d '${tmp.cmd}')"
+pre_transaction::::/usr/bin/sh -c echo "tmp.snapper_pre_home=$(snapper -c home create -c number -t pre -p -d '${tmp.cmd}')"
+# Creates post snapshots for root and home if pre snapshot numbers exist
+post_transaction::::/usr/bin/sh -c [ -n "${tmp.snapper_pre_root}" ] && snapper -c root create -c number -t post --pre-number "${tmp.snapper_pre_root}" -d "${tmp.cmd}"
+post_transaction::::/usr/bin/sh -c [ -n "${tmp.snapper_pre_home}" ] && snapper -c home create -c number -t post --pre-number "${tmp.snapper_pre_home}" -d "${tmp.cmd}"
+EOF
 ```
 
 ---
@@ -347,8 +357,9 @@ grub2-mkconfig -o /boot/grub2/grub.cfg
 
 ## SELinux
 Your Arch box has none — pick one:
-- **Keep enforcing** (recommended): `touch /.autorelabel`, boot once with `selinux=0` (press `e` in GRUB, append to cmdline), relabel runs, reboot to enforcing.
-- **Disable** (feels like Arch): `sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config` (skip `/.autorelabel`).
+- **Permissive** (good Arch→Fedora transition: logs denials but doesn't block): `sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config` **and** `touch /.autorelabel` so filesystem labels get set on first boot (permissive still needs correct labels to stay quiet; relabel runs at boot).
+- **Keep enforcing** (recommended, strictest): `touch /.autorelabel`, boot once with `selinux=0` (press `e` in GRUB, append to cmdline), relabel runs, reboot to enforcing.
+- **Disable** (feels like Arch, no SELinux at all): `sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config` (skip `/.autorelabel`).
 
 ---
 
@@ -436,7 +447,7 @@ All Fedora entries below were verified to exist in the Fedora 44 repos; RPM Fusi
 | `nvidia-open-dkms` | `akmod-nvidia-open` (RPM Fusion nonfree-tainted) or `akmod-nvidia` |
 | `cuda`, `opencl-nvidia` | not in RPM Fusion F44; use NVIDIA's CUDA repo / driver-built OpenCL |
 | `yay` / AUR | `dnf copr enable` + Terra + RPM Fusion + Flatpak |
-| `snap-pac` | `dnf5-autosnapper` (COPR biyuan/dnf5-autosnapper) |
+| `snap-pac` | `libdnf5-plugin-actions` + `snapper.actions` (auto pre/post snapshots; see Snapper section) |
 | `limine-snapper-sync` | n/a — Snapper is your choice; GRUB boots snapshots directly |
 | `btrfs-assistant`, `snapper-gui` | `btrfs-assistant` (Fedora), `snapper` |
 | `ttf-*` fonts | `google-noto-*-fonts`, `dejavu-sans-fonts`, `jetbrains-mono-fonts`, `fira-code-fonts`, `liberation-fonts-all`, `adobe-source-*-pro-fonts`, `terminus-fonts` |
