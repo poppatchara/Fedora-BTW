@@ -48,7 +48,7 @@ Download from https://getfedora.org/ and verify the checksum before writing to U
 
 | Partition | Size | Type | Purpose |
 |-----------|------|------|---------|
-| `/dev/nvme0n1p1` | 2-4 GB | EFI System | `/boot` |
+| `/dev/nvme0n1p1` | 2-4 GB | EFI System | `/boot/efi` |
 | `/dev/nvme0n1p2` | Remainder | Linux filesystem | Btrfs root |
 | `/dev/nvme0n1p3` | ~RAM | swap | swap |
 
@@ -82,7 +82,15 @@ mount --mkdir -o compress=zstd:1,noatime,subvol=@var_cache UUID="${root_uuid}" /
 mount --mkdir -o compress=zstd:1,noatime,subvol=@root      UUID="${root_uuid}" /mnt/root
 mount --mkdir -o compress=zstd:1,noatime,subvol=@srv       UUID="${root_uuid}" /mnt/srv
 
-mount --mkdir UUID="${esp_uuid}" /mnt/boot
+# /boot lives on the root subvolume @ (no separate @boot) so kernels and
+# initramfs are rolled back together with a root snapshot. ESP (vfat) is
+# mounted later at /boot/efi — Fedora's standard split.
+mkdir -p /mnt/boot
+
+# ESP (vfat) as /boot/efi. grub2 installs its EFI loader + a small stub
+# /boot/efi/EFI/fedora/grub.cfg here; the real config lives at
+# /boot/grub2/grub.cfg on the btrfs /boot above.
+mount --mkdir UUID="${esp_uuid}" /mnt/boot/efi
 swapon UUID="${swap_uuid}"
 
 mkdir -p /mnt/etc
@@ -102,7 +110,7 @@ UUID=${root_uuid} /var/log          btrfs subvol=/@var_log,noatime,x-systemd.dev
 UUID=${root_uuid} /var/cache        btrfs subvol=/@var_cache,noatime,x-systemd.device-timeout=0 0 0
 UUID=${root_uuid} /root             btrfs subvol=/@root,noatime,x-systemd.device-timeout=0 0 0
 UUID=${root_uuid} /srv              btrfs subvol=/@srv,noatime,x-systemd.device-timeout=0 0 0
-UUID=${esp_uuid}  /boot             vfat umask=0077,shortname=winnt 0 2
+UUID=${esp_uuid}  /boot/efi         vfat umask=0077,shortname=winnt 0 2
 UUID=${swap_uuid} none              swap sw 0 0
 EOF
 
@@ -248,7 +256,8 @@ GRUB_CMDLINE_LINUX="rhgb quiet loglevel=3 rootflags=subvol=@ resume=UUID=${swap_
 GRUB_DISABLE_RECOVERY="true"
 EOF
 
-grub2-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Fedora
+# ESP is mounted at /boot/efi; the real grub.cfg lives at /boot/grub2/grub.cfg on btrfs /boot
+grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Fedora
 grub2-mkconfig -o /boot/grub2/grub.cfg
 
 # dual-boot? uncomment for os-prober:
