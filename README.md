@@ -11,19 +11,20 @@ Not the best or most correct way. Just the way I like.
 2. [Partition & Format](#partition--format)
 3. [Subvolumes & Mounts](#subvolumes--mounts)
 4. [Bootstrap Base](#bootstrap-base)
-5. [Chroot Config](#chroot-config)
-6. [Repositories](#repositories)
-7. [GRUB Bootloader](#grub-bootloader)
-8. [Services](#services)
-9. [Desktop Stack](#desktop-stack)
-10. [Codecs & Non-Free](#codecs--non-free)
-11. [Snapper & Btrfs Tools](#snapper--btrfs-tools)
-12. [NVIDIA Driver](#nvidia-driver)
-13. [SELinux](#selinux)
-14. [Reboot](#reboot)
-15. [Post-Install](#post-install)
-16. [Package Map (Arch → Fedora)](#package-map-arch--fedora)
-17. [Credits](#credits)
+5. [Speed Up dnf (live ISO)](#speed-up-dnf-live-iso)
+6. [Chroot Config](#chroot-config)
+7. [Repositories](#repositories)
+8. [GRUB Bootloader](#grub-bootloader)
+9. [Services](#services)
+10. [Desktop Stack](#desktop-stack)
+11. [Codecs & Non-Free](#codecs--non-free)
+12. [Snapper & Btrfs Tools](#snapper--btrfs-tools)
+13. [NVIDIA Driver](#nvidia-driver)
+14. [SELinux](#selinux)
+15. [Reboot](#reboot)
+16. [Post-Install](#post-install)
+17. [Package Map (Arch → Fedora)](#package-map-arch--fedora)
+18. [Credits](#credits)
 
 ---
 
@@ -99,7 +100,7 @@ mkdir -p /mnt/etc/yum.repos.d
 cat > /mnt/etc/yum.repos.d/fedora.repo <<'EOF'
 [fedora]
 name=Fedora $releasever - $basearch
-metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch
+metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch&country=th,sg,my
 enabled=1
 countme=1
 metadata_expire=7d
@@ -113,6 +114,84 @@ dnf --installroot=/mnt --releasever=44 group install "Core"
 for f in dev proc sys sys/firmware/efi/efivars; do mount --bind /$f /mnt/$f; done
 cp /etc/resolv.conf /mnt/etc/resolv.conf
 chroot /mnt /bin/bash
+```
+
+---
+
+## Speed Up dnf (live ISO)
+
+Make the live ISO's `dnf` faster before bootstrapping. Fedora defaults to 3 parallel downloads and lets MirrorManager (server-side) pick mirrors with smarter heuristics than any client-side tool.
+
+> **Note:** the parallel `dnf.conf` settings apply to the **live ISO session**. If you want them on the installed system too, repeat them inside the chroot (chroot inherits `/etc/dnf/dnf.conf` from the live ISO via the mount bind only if you copy it — see below).
+
+### Parallel downloads
+
+Fedora ships dnf5, configured for 3 concurrent downloads. On a fast link that leaves bandwidth on the table. Bump it up (max 20):
+
+```bash
+sudo dnf config-manager setopt max_parallel_downloads=10 \
+      max_downloads_per_mirror=10
+```
+
+This writes to `/etc/dnf/dnf.conf` on the **live ISO**. To carry it into the installed system, either rerun it inside the chroot, or copy the file:
+
+```bash
+cp /etc/dnf/dnf.conf /mnt/etc/dnf/dnf.conf   # before chroot
+```
+
+| Option | Default | Max | Effect |
+|--------|---------|-----|--------|
+| `max_parallel_downloads` | 3 | 20 | Concurrent package downloads overall |
+| `max_downloads_per_mirror` | 3 | 20 | Concurrent downloads from a single mirror |
+
+**Leave `fastestmirror=False`.** Unlike `reflector`, Fedora's `fastestmirror` ranks mirrors by **TCP socket latency only** — it ignores bandwidth and overrides MirrorManager's ordering. Fedora's server-side mirror selection already accounts for bandwidth, geographic proximity, and load, so it is almost always smarter. If you enable it anyway and it feels worse, turn it off.
+
+### Reflector-like mirror list
+
+Fedora has no direct `reflector` — but you don't need one. The `metalink` URL asks Fedora MirrorManager to return a ranked mirror list, and you can bias it toward your region with the `country=` param (ISO 3166-1 alpha-2, comma-separated). This is the Fedora equivalent of `reflector -c Thailand -c Singapore`.
+
+Add your region to the `metalink` lines in `/etc/yum.repos.d/fedora.repo` and `/etc/yum.repos.d/fedora-updates.repo`:
+
+```bash
+# live ISO: Asia-Pacific preference (th/sg/my), fall back to global
+sudo sed -i \
+  's#metalink=\(.*\)#metalink=\1\&country=th,sg,my#' \
+  /etc/yum.repos.d/fedora.repo /etc/yum.repos.d/fedora-updates.repo
+```
+
+Or edit by hand — the `country` lives at the end of each `metalink` line:
+
+```ini
+# /etc/yum.repos.d/fedora.repo
+metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch&country=th,sg,my
+
+# /etc/yum.repos.d/fedora-updates.repo
+metalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch&country=th,sg,my
+```
+
+For persistent overrides that survive dnf repo resets, drop a file in `/etc/dnf/repos.override.d/` instead (you only need the repos you use — `[fedora]` and `[updates]`):
+
+```bash
+sudo mkdir -p /etc/dnf/repos.override.d
+sudo tee /etc/dnf/repos.override.d/95-mirrors.repo >/dev/null <<'EOF'
+[fedora]
+metalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch&country=th,sg,my
+
+[updates]
+metalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch&country=th,sg,my
+EOF
+```
+
+> **RPM Fusion** and **Terra** (added later in this guide) use their own `baseurl` lists — the `country=` mirror trick does not apply to them. RPM Fusion publishes a country-specific mirrorlist at `https://mirrors.rpmfusion.org/mirrorlist?repo=...&arch=...&country=th` if you want the same treatment there.
+
+### Verify
+
+Clear the metadata cache and confirm dnf now points at regional mirrors:
+
+```bash
+sudo dnf clean all
+sudo dnf repolist -v | grep -E 'repo-id|Repo-metalink|Repo-baseurl'
+sudo dnf repolist -v   # Base URLs should show th/sg/my mirrors (e.g. mirror.kku.ac.th)
 ```
 
 ---
