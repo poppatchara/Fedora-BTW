@@ -10,8 +10,8 @@ Not the best or most correct way. Just the way I like.
 1. [Assumptions](#assumptions)
 2. [Partition & Format](#partition--format)
 3. [Subvolumes & Mounts](#subvolumes--mounts)
-4. [Bootstrap Base](#bootstrap-base)
-5. [Speed Up dnf (live ISO)](#speed-up-dnf-live-iso)
+4. [Speed Up dnf (live ISO)](#speed-up-dnf-live-iso)
+5. [Bootstrap Base](#bootstrap-base)
 6. [Chroot Config](#chroot-config)
 7. [Repositories](#repositories)
 8. [GRUB Bootloader](#grub-bootloader)
@@ -65,22 +65,19 @@ swap_uuid="$(blkid -s UUID -o value /dev/nvme0n1p3)"
 ---
 
 ## Subvolumes & Mounts
-Same `@` layout as my Arch memo so Snapper semantics carry over.
+Same @ layout as my Arch memo so Snapper semantics carry over. Uses the **Fedora layout** (`@` at /, `@home` at /home, `@var_log` at /var/log, `@var_cache` at /var/cache) with no separate `@var`, `@root` or `@srv` — so `/var/lib` (incl. dnf/rpm package state) and `/root` stay inside the root `@` subvolume and are captured by root snapshots. Snapper auto-excludes `@home`, `@var_log` and `@var_cache` from root snapshots.
 
 ```bash
 mount UUID="${root_uuid}" /mnt
-for s in @ @home @var @var_log @var_cache @root @srv; do
+for s in @ @home @var_log @var_cache; do
   btrfs subvolume create /mnt/$s
 done
 umount -R /mnt
 
 mount -o compress=zstd:1,noatime,subvol=@ UUID="${root_uuid}" /mnt
 mount --mkdir -o compress=zstd:1,noatime,subvol=@home      UUID="${root_uuid}" /mnt/home
-mount --mkdir -o compress=zstd:1,noatime,subvol=@var       UUID="${root_uuid}" /mnt/var
 mount --mkdir -o compress=zstd:1,noatime,subvol=@var_log   UUID="${root_uuid}" /mnt/var/log
 mount --mkdir -o compress=zstd:1,noatime,subvol=@var_cache UUID="${root_uuid}" /mnt/var/cache
-mount --mkdir -o compress=zstd:1,noatime,subvol=@root      UUID="${root_uuid}" /mnt/root
-mount --mkdir -o compress=zstd:1,noatime,subvol=@srv       UUID="${root_uuid}" /mnt/srv
 
 # /boot lives on the root subvolume @ (no separate @boot) so kernels and
 # initramfs are rolled back together with a root snapshot. ESP (vfat) is
@@ -105,11 +102,8 @@ cat > /mnt/etc/fstab <<EOF
 # <file system> <mount point> <type> <options> <dump> <pass>
 UUID=${root_uuid} /                 btrfs subvol=/@,compress=zstd:1,noatime,x-systemd.device-timeout=0 0 0
 UUID=${root_uuid} /home             btrfs subvol=/@home,compress=zstd:1,noatime,x-systemd.device-timeout=0 0 0
-UUID=${root_uuid} /var              btrfs subvol=/@var,compress=zstd:1,noatime,x-systemd.device-timeout=0 0 0
 UUID=${root_uuid} /var/log          btrfs subvol=/@var_log,noatime,x-systemd.device-timeout=0 0 0
 UUID=${root_uuid} /var/cache        btrfs subvol=/@var_cache,noatime,x-systemd.device-timeout=0 0 0
-UUID=${root_uuid} /root             btrfs subvol=/@root,noatime,x-systemd.device-timeout=0 0 0
-UUID=${root_uuid} /srv              btrfs subvol=/@srv,noatime,x-systemd.device-timeout=0 0 0
 UUID=${esp_uuid}  /boot/efi         vfat umask=0077,shortname=winnt 0 2
 UUID=${swap_uuid} none              swap sw 0 0
 EOF
@@ -119,8 +113,40 @@ cat /mnt/etc/fstab
 
 ---
 
+## Speed Up dnf (live ISO)
+
+Bump parallel downloads (default 3, max 20) and bias mirror selection to your region on the **live ISO** before anything mounts into/installs into `/mnt` (the bootstrap repo + `dnf.conf` below already land in `/mnt`, so `/mnt/etc` must exist first — do this after Subvolumes & Mounts creates it):
+
+```bash
+# parallel downloads (persist to install root for installed system)
+sudo dnf config-manager setopt max_parallel_downloads=10 max_downloads_per_mirror=10
+cp /etc/dnf/dnf.conf /mnt/etc/dnf/dnf.conf
+
+# regional mirrors — append country= to the metalink (ISO 3166 alpha-2).
+# Idempotent: strips any pre-existing &country= before appending, so rerunning
+# these two files never duplicates the parameter.
+sudo sed -i 's#&country=[^&]*##; s#metalink=\(.*\)#metalink=\1\&country=th,sg,my#' \
+  /etc/yum.repos.d/fedora.repo /etc/yum.repos.d/fedora-updates.repo
+```
+
+Leave `fastestmirror=False`: Fedora's filter ranks mirrors by **TCP latency only** — it ignores bandwidth and overrides MirrorManager's (server-side) bandwidth/load/geo heuristics. On the installed system the bootstrap `fedora.repo` already carries `&country=th,sg,my`; rerun the two `dnf` lines inside the chroot if you want the same there. `country=` does not apply to RPM Fusion / Terra (they use `baseurl`).
+
+### Verify
+
+Clear the metadata cache and confirm dnf now points at regional mirrors:
+
+```bash
+sudo dnf clean all
+sudo dnf repolist -v | grep -E 'repo-id|Repo-metalink|Repo-baseurl'
+sudo dnf repolist -v   # Base URLs should show th/sg/my mirrors (e.g. mirror.kku.ac.th)
+```
+
+Sanity check: `grep '^metalink=' /etc/yum.repos.d/fedora.repo` should contain a single `&country=th,sg,my`, even after running the sed twice.
+
+---
+
 ## Bootstrap Base
-`dnf --installroot` is Fedora's `pacstrap`. First write a repo file so dnf knows where to pull from.
+`dnf --installroot` is Fedora's `pacstrap`. First write a repo file so dnf knows where to pull from. Environment: **live ISO root shell** (`sudo bash` or a TTY root).
 
 ```bash
 # Fedora live ISO has no `pacstrap`; `dnf --installroot` is the equivalent
@@ -143,44 +169,24 @@ EOF
 # copy the network resolver in BEFORE dnf runs, so metalink lookups resolve
 cp /etc/resolv.conf /mnt/etc/resolv.conf
 
-# mount the virtual filesystems BEFORE dnf --installroot. dnf runs RPM
-# scriptlets against the target tree; without /proc + /sys they fail with
-# e.g. "cpio: cap_set_file failed - Operation not supported" (the scriptlets
-# can't set capabilities when /proc is absent).
-for f in dev proc sys sys/firmware/efi/efivars; do mount --bind /$f /mnt/$f; done
+# create the mount targets BEFORE binding the virtual filesystems. `mount --bind`
+# silently skips or fails when the mountpoint doesn't exist yet, so /mnt/dev,
+# /mnt/proc, /mnt/sys, /mnt/run and the efivars dir must be created first.
+mkdir -p /mnt/dev /mnt/proc /mnt/sys /mnt/run /mnt/sys/firmware/efi/efivars
+
+# bind the virtual filesystems BEFORE dnf --installroot. dnf runs RPM scriptlets
+# against the target tree; without /proc + /sys they fail with e.g.
+# "cpio: cap_set_file failed - Operation not supported" (the scriptlets can't
+# set capabilities when /proc is absent).
+for f in dev proc sys run sys/firmware/efi/efivars; do mount --bind /$f /mnt/$f; done
+
+# sanity check: every bind target should now show a non-empty mount
+mount | grep -- /mnt/   # expect /mnt/dev, /mnt/proc, /mnt/sys, /mnt/run lines
 
 # `core` is the Fedora group id for a minimal base (comps display name "Core").
 dnf --installroot=/mnt --releasever=44 group install core
 
 chroot /mnt /bin/bash
-```
-
----
-
-## Speed Up dnf (live ISO)
-
-Bump parallel downloads (default 3, max 20) and bias mirror selection to your region on the **live ISO** before bootstrapping:
-
-```bash
-# parallel downloads (persist to install root for installed system)
-sudo dnf config-manager setopt max_parallel_downloads=10 max_downloads_per_mirror=10
-cp /etc/dnf/dnf.conf /mnt/etc/dnf/dnf.conf
-
-# regional mirrors — append country= to the metalink (ISO 3166 alpha-2)
-sudo sed -i 's#metalink=\(.*\)#metalink=\1\&country=th,sg,my#' \
-  /etc/yum.repos.d/fedora.repo /etc/yum.repos.d/fedora-updates.repo
-```
-
-Leave `fastestmirror=False`: Fedora's filter ranks mirrors by **TCP latency only** — it ignores bandwidth and overrides MirrorManager's (server-side) bandwidth/load/geo heuristics. On the installed system the bootstrap `fedora.repo` already carries `&country=th,sg,my`; rerun the two `dnf` lines inside the chroot if you want the same there. `country=` does not apply to RPM Fusion / Terra (they use `baseurl`).
-
-### Verify
-
-Clear the metadata cache and confirm dnf now points at regional mirrors:
-
-```bash
-sudo dnf clean all
-sudo dnf repolist -v | grep -E 'repo-id|Repo-metalink|Repo-baseurl'
-sudo dnf repolist -v   # Base URLs should show th/sg/my mirrors (e.g. mirror.kku.ac.th)
 ```
 
 ---
@@ -210,7 +216,11 @@ cat > /etc/hosts <<'EOF'
 EOF
 
 passwd
-useradd -mG wheel,storage,power,audio,video -s /bin/bash pop
+# Fedora-safe complementary groups: wheel (sudo), audio, video exist on a
+# clean install. `storage` and `power` do NOT exist on Fedora 44 (Arch adds
+# them; Fedora manages USB/drive/power policy via udisks2 + logind tags), so
+# including them would make useradd fail with "group 'storage' does not exist".
+useradd -mG wheel,audio,video -s /bin/bash pop
 passwd pop
 chown -R pop:pop /home/pop
 EDITOR=nvim visudo                                    # uncomment: %wheel ALL=(ALL) ALL
@@ -294,8 +304,14 @@ systemctl enable sddm power-profiles-daemon
 
 ## Codecs & Non-Free
 ```bash
-# full multimedia codecs (replaces ffmpeg-free)
-dnf install ffmpeg ffmpeg-libs libavcodec-freeworld \
+# full multimedia codecs. RPM Fusion's way: swap the stripped ffmpeg-free for
+# the full ffmpeg (ffmpeg pulls ffmpeg-libs + a full libavcodec built with all
+# codecs, so libavcodec-freeworld is not needed here). --allowerasing resolves
+# the ffmpeg-free <-> ffmpeg file conflicts.
+dnf swap ffmpeg-free ffmpeg --allowerasing
+
+# remaining freeworld/gstreamer bits (RPM Fusion free)
+dnf install \
   gstreamer1-plugins-ugly gstreamer1-plugins-bad-freeworld \
   x264 x265 gstreamer1-plugin-openh264 mesa-va-drivers-freeworld
 
@@ -327,12 +343,12 @@ cat > /etc/dnf/libdnf5-plugins/actions.d/snapper.actions <<'EOF'
 # snapper auto-cleanup. source: Fedora Discussion #133948
 # Get the snapshot description
 pre_transaction::::/usr/bin/sh -c echo "tmp.cmd=$(ps -o command --no-headers -p '${pid}')"
-# Creates pre snapshots for root and home, store snapshot numbers
+# Creates a pre snapshot of root (packages land in /var/lib on the @ subvol),
+# store snapshot number. Home is intentionally NOT snapshotted per-transaction -
+# only root, so package transactions don't churn snapshot space on /home.
 pre_transaction::::/usr/bin/sh -c echo "tmp.snapper_pre_root=$(snapper -c root create -c number -t pre -p -d '${tmp.cmd}')"
-pre_transaction::::/usr/bin/sh -c echo "tmp.snapper_pre_home=$(snapper -c home create -c number -t pre -p -d '${tmp.cmd}')"
-# Creates post snapshots for root and home if pre snapshot numbers exist
+# Creates a post snapshot of root if the pre snapshot number exists
 post_transaction::::/usr/bin/sh -c [ -n "${tmp.snapper_pre_root}" ] && snapper -c root create -c number -t post --pre-number "${tmp.snapper_pre_root}" -d "${tmp.cmd}"
-post_transaction::::/usr/bin/sh -c [ -n "${tmp.snapper_pre_home}" ] && snapper -c home create -c number -t post --pre-number "${tmp.snapper_pre_home}" -d "${tmp.cmd}"
 EOF
 ```
 
@@ -348,18 +364,27 @@ dnf install akmod-nvidia xorg-x11-drv-nvidia \
 # dnf install --enablerepo=rpmfusion-nonfree-tainted akmod-nvidia-open
 ```
 ```bash
-echo 'nvidia-drm.modeset=1 nvidia-drm.fbdev=1' >> /etc/default/grub   # add to GRUB_CMDLINE_LINUX
-grub2-mkconfig -o /boot/grub2/grub.cfg
-# first boot rebuilds the akmod DKMS module; reboot once more
+# Add NVIDIA kernel args the Fedora way with grubby (updates /boot/loader/entries/*
+# AND /etc/default/grub so they stay in sync — never hand-append to GRUB_CMDLINE_LINUX).
+# Run AFTER the akmod-nvidia packages above are installed, still inside the chroot.
+grubby --update-kernel=ALL --args='nvidia-drm.modeset=1 nvidia-drm.fbdev=1'
+# sanity check — inspect all installed BLS entries (the live ISO's `uname -r`
+# is not the target kernel while this block runs inside the chroot).
+grubby --info=ALL | grep -E '^args=.*nvidia-drm\.(modeset|fbdev)='
+# akmods may finish building during the first boot; verify the module after reboot
+# and rebuild only if `modinfo nvidia` reports it is missing.
 ```
 
 ---
 
 ## SELinux
-Your Arch box has none — pick one:
-- **Permissive** (good Arch→Fedora transition: logs denials but doesn't block): `sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config` **and** `touch /.autorelabel` so filesystem labels get set on first boot (permissive still needs correct labels to stay quiet; relabel runs at boot).
-- **Keep enforcing** (recommended, strictest): `touch /.autorelabel`, boot once with `selinux=0` (press `e` in GRUB, append to cmdline), relabel runs, reboot to enforcing.
-- **Disable** (feels like Arch, no SELinux at all): `sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config` (skip `/.autorelabel`).
+Your Arch box has none — start with **enforcing** and use `/.autorelabel`. Fedora ships its policy labeled in the base install, but because we hand-built the tree (not via the installer/Anaconda), a one-time relabel on first boot is the reliable way to make sure every file/dir has a label.
+
+- **Enforce (recommended default)**: leave `/etc/selinux/config` as `SELINUX=enforcing` and run `touch /.autorelabel`. On next boot systemd-autorelabel relabels the whole tree, then the system boots enforcing. The `/.autorelabel` marker is consumed automatically — you don't need to remove it or rerun `touch /.autorelabel` after a successful relabel.
+- **One-boot permissive to sort labels/denials** (keep config enforcing): if first boot fails or logs denials, boot once with `enforcing=0` appended to the kernel cmdline (press `e` in GRUB, append to the `linux`/linuxefi line). That boots permissive so labels still get applied and you can log in to debug; it only affects that single boot, the config stays enforcing.
+  - Note: use `enforcing=0`, **not** `selinux=0`. `selinux=0` turns SELinux off for that boot entirely and can leave files unlabeled, which is wrong when your goal is a relabel.
+- **Permissive in the config** (optional): `sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config` && `touch /.autorelabel`. Logs denials but blocks nothing. Handy for a first transition from Arch, but enforcing above is the recommended end state.
+- **Disable** (discouraged — only if you really want no SELinux): `sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config`. Do NOT `touch /.autorelabel` in this case (nothing to relabel). Keep in mind disabling removes a real Fedora security layer and some packages/services may show policy-related warnings.
 
 ---
 
@@ -442,7 +467,7 @@ All Fedora entries below were verified to exist in the Fedora 44 repos; RPM Fusi
 | `qt6-wayland`, `xorg-xwayland` | `qt6-qtwayland`, `xorg-x11-server-Xwayland` |
 | `gamemode`, `mangohud`, `goverlay`, `lutris` | same (Fedora official) |
 | `steam` (non-free) | `steam` (RPM Fusion nonfree) |
-| `ffmpeg`, codecs | `ffmpeg ffmpeg-libs libavcodec-freeworld gstreamer1-plugins-ugly gstreamer1-plugins-bad-freeworld x264 x265` (RPM Fusion free) |
+| `ffmpeg`, codecs | `dnf swap ffmpeg-free ffmpeg --allowerasing` + `gstreamer1-plugins-ugly gstreamer1-plugins-bad-freeworld x264 x265` (RPM Fusion free) |
 | `libdvdcss` | `libdvdcss` (RPM Fusion free-tainted) |
 | `nvidia-open-dkms` | `akmod-nvidia-open` (RPM Fusion nonfree-tainted) or `akmod-nvidia` |
 | `cuda`, `opencl-nvidia` | not in RPM Fusion F44; use NVIDIA's CUDA repo / driver-built OpenCL |
